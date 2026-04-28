@@ -1,0 +1,74 @@
+name: Deploy to Tencent Cloud (Docker Compose)
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy via SSH + Docker Compose
+        env:
+          SERVER_HOST: ${{ secrets.TENCENT_SERVER_HOST }}
+          SERVER_USER: ${{ secrets.TENCENT_SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.TENCENT_SERVER_PASSWORD }}
+        run: |
+          sudo apt-get update && sudo apt-get install -y sshpass rsync
+
+          # 同步代码到服务器（排除不需要的文件）
+          sshpass -p "${SERVER_PASSWORD}" rsync -avz --delete \
+            --exclude='.env*' \
+            --exclude='.git' \
+            --exclude='__pycache__' \
+            --exclude='*.pyc' \
+            --exclude='logs' \
+            ./ ${SERVER_USER}@${SERVER_HOST}:/opt/jiaxiaohutong/backend/
+
+          # 远程：生成 .env 并用 docker compose 部署
+          sshpass -p "${SERVER_PASSWORD}" ssh -o StrictHostKeyChecking=no ${SERVER_USER}@${SERVER_HOST} << 'DEPLOY'
+            set -e
+            cd /opt/jiaxiaohutong/backend
+
+            # 生成生产环境 .env（敏感值从 GitHub Secrets 注入）
+            cat > .env << 'ENVEOF'
+            ENV=production
+            DEBUG=false
+            BACKEND_PORT=8000
+            DB_HOST=${{ secrets.DB_HOST }}
+            DB_PORT=${{ secrets.DB_PORT }}
+            DB_USER=${{ secrets.DB_USER }}
+            DB_PASSWORD=${{ secrets.DB_PASSWORD }}
+            DB_NAME=${{ secrets.DB_NAME }}
+            JWT_SECRET_KEY=${{ secrets.JWT_SECRET_KEY }}
+            CORS_ORIGINS=https://admin.jiaxiaohutong.com
+            ENVEOF
+
+            echo "=== Docker Compose 构建 & 启动 ==="
+            docker compose pull || true
+            docker compose up -d --build --remove-orphans
+
+            echo "=== 等待健康检查 ==="
+            sleep 8
+            curl -sf http://localhost:${BACKEND_PORT:-8000}/api/health \
+              && echo "" && echo "✅ 部署成功" \
+              || (echo "❌ 健康检查失败"; docker compose logs --tail=30; exit 1)
+
+            echo "=== 清理旧镜像 ==="
+            docker image prune -f --filter "until=24h"
+          DEPLOY
+
+      - name: Deployment Summary
+        if: always()
+        run: |
+          echo "部署状态: ${{ job.status }}"
+          [[ "${{ job.status }}" == "success" ]] && exit 0 || exit 1
